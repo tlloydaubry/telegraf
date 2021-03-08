@@ -144,22 +144,6 @@ func (s *S3Consumer) authenticateCredentials() (*session.Session, error) {
 func (s *S3Consumer) Gather(_ telegraf.Accumulator) error {
     return nil
 }
-// or
-func (s *S3Consumer) Gather(acc telegraf.Accumulator) error {
-    // read s.PrefetchCount messages from SQS queue
-    // for event in events
-    //   if event == creation event
-    //     read file
-    //     accumulate metrics
-    // loop
-
-    if s.Ok {
-        acc.AddFields("state", map[string]interface{}{"value": "pretty good"}, nil)
-    } else {
-        acc.AddFields("state", map[string]interface{}{"value": "not great"}, nil)
-    }
-    return nil
-}
 
 // poll sqs messages and write to buffered go channel
 func (s *S3Consumer) sqsConsumer(msgs chan<- string) {
