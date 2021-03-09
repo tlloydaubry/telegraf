@@ -61,6 +61,8 @@ type S3Consumer struct {
     sqs *SQS
     s3 *S3
 
+    deliveries map[telegraf.TrackingID]*string
+
     wg *sync.WaitGroup
     cancel context.CancelFunc
     Log telegraf.Logger
@@ -179,59 +181,116 @@ func (s *S3Consumer) sqsConsumer(msgs chan<- string) {
     return nil
 }
 
-// read sqs message from go channel and read associated S3 file and write metrics to accumulator
-func (s *S3Consumer) processor(msgs <-chan events.S3Entity, acc telegraf.Accumulator) error {
-    defer s.wg.Done()
-    for {
-        entity := <-msgs
+func (s *S3Consumer) onS3Event(entity events.S3Entity) error {
+    req, err := s.s3.GetObject(&s3.GetObjectInput{
+        Bucket: aws.String(entity.Bucket.Name),
+        Key: aws.String(entity.S3Object.Key),
+    })
+    if err != nil {
+        s.Log.Errorf("Failed to get S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
+        continue
+    }
 
-        req, err := s.s3.GetObject(&s3.GetObjectInput{
-            Bucket: aws.String(entity.Bucket.Name),
-            Key: aws.String(entity.S3Object.Key),
+    body, err := ioutils.ReadAll(req.Body)
+    if err != nil {
+        s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
+        continue
+    }
+
+    decoded, err := s.decoder.Decode(body)
+    if err != nil {
+        s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
+        continue
+    }
+
+    metrics, err := s.parser.Parse(decoded)
+    if err != nil {
+        s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
+        continue
+    }
+
+    for _, m := range metrics {
+        acc.AddMetric(m)
+    }
+    /*
+    // or should we try to read files in parts to allow for the occurance of large files without blowing out memory?
+    scanner := bufio.NewScanner(req.Body)
+    for scanner.Scan() {
+        // fmt.Println(scanner.Text())
+        body, err := a.decoder.Decode(scanner.Text())
+        if err != nil {
+            a.Log.Errorf
+    }
+    */
+    req.Body.Close()
+    // TODO delete sqs message now that the file has been read
+
+}
+
+func (s *S3Consumer) onDelivery(track telegraf.DeliveryInfo) bool {
+    delivery := s.deliveries[track.ID()]
+    if track.Delivered() {
+        _, err := s.sqs.DeleteMessage(&sqs.DeleteMessageInput{
+            QueueUrl: aws.String(s.SQSQueueUrl),
+            ReceiptHandle: delivery,
         })
         if err != nil {
-            s.Log.Errorf("Failed to get S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
-            continue
+            s.Log.Errorf("Unable to delete written s3event: %s: %v", delivery, err)
         }
-
-        body, err := ioutils.ReadAll(req.Body)
+    } else {
+        // make message visible again to allow another consumer to try processing it
+        _, err := s.sqs.ChangeMessageVisibility(&sqs.ChangeMessageVisibilityInput{
+            QueueUrl: aws.String(s.SQSQueueUrl),
+            ReceiptHandle: delivery,
+            VisibilityTimeout: aws.Integer(0),
+        })
         if err != nil {
-            s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
-            continue
+            s.Log.Errorf("Unable to change visibility of failed delivery: %s: %v", delivery, err)
         }
+    }
 
-        decoded, err := s.decoder.Decode(body)
-        if err != nil {
-            s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
-            continue
-        }
+    delete(s.deliveries, track.ID())
+    return true
+}
 
-        metrics, err := s.parser.Parse(decoded)
-        if err != nil {
-            s.Log.Errorf("Failed to read S3 object %s/%s. %v", entity.Bucket.Name, entity.S3Object.Key, err)
-            continue
-        }
+// read sqs message from go channel and read associated S3 file and write metrics to accumulator
+func (s *S3Consumer) processor(msgs <-chan events.S3Entity, ac telegraf.Accumulator) error {
+    defer s.wg.Done()
 
-        for _, m := range metrics {
-            acc.AddMetric(m)
+    acc := ac.WithTracking(s.MaxUndeliveredMessages)
+    sem := make(semaphore, s.MaxUndeliveredMessages)
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case track := <-acc.Delivered():
+            if s.onDelivery(track) {
+                <-sem
+            }
+        case sem <- empty{}:
+            select {
+            case <-ctx.Done():
+                return
+            case track := <- acc.Delivered():
+                if s.onDelivery(track) {
+                    <-sem
+                    <-sem
+                }
+            case entity := <-msgs:
+                err := s.onS3Entity(entity)
+                if err != nil {
+                    acc.AddError(err)
+                    <-sem
+                }
+            }
         }
-        /*
-        // or should we try to read files in parts to allow for the occurance of large files without blowing out memory?
-        scanner := bufio.NewScanner(req.Body)
-        for scanner.Scan() {
-            // fmt.Println(scanner.Text())
-            body, err := a.decoder.Decode(scanner.Text())
-            if err != nil {
-                a.Log.Errorf
-        }
-        */
-        req.Body.Close()
-        // TODO delete sqs message now that the file has been read
     }
     return nil
 }
 
 func (s *S3Consumer) Start(acc telegraf.Accumulator) error {
+    s.deliveries = make(map[telegraf.TrackingID]*string)
     s.decoder, err = internal.NewContentDecorder(s.ContentEncoding)
     if err != nil {
         return err
